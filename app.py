@@ -8,7 +8,14 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
-from pypdf import PdfReader
+from pypdf import PasswordType, PdfReader
+from pypdf.errors import (
+    DependencyError,
+    EmptyFileError,
+    FileNotDecryptedError,
+    PdfReadError,
+    WrongPasswordError,
+)
 
 
 load_dotenv()
@@ -48,6 +55,10 @@ APP_COLORS = {
 DEFAULT_MODEL = "gpt-4.1-mini"
 MAX_TEXT_CHARS = 120_000
 MAX_FIELD_CONTEXT_CHARS = 12_000
+
+
+class PdfExtractionError(Exception):
+    """Raised when uploaded PDF text cannot be extracted safely."""
 
 
 def inject_css() -> None:
@@ -357,12 +368,34 @@ def get_api_key() -> str:
 
 @st.cache_data(show_spinner=False)
 def extract_pdf_text(file_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(file_bytes))
-    all_pages: List[str] = []
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        if page_text.strip():
-            all_pages.append(page_text)
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        if reader.is_encrypted:
+            decrypt_result = reader.decrypt("")
+            if decrypt_result == PasswordType.NOT_DECRYPTED:
+                raise PdfExtractionError(
+                    "Dieses PDF ist passwortgeschuetzt. Bitte lade eine unverschluesselte Version hoch."
+                )
+
+        all_pages: List[str] = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                all_pages.append(page_text)
+    except DependencyError as exc:
+        raise PdfExtractionError(
+            "Dieses PDF ist verschluesselt. Auf dem Server fehlt die pypdf-Krypto-Unterstuetzung. "
+            "Deploye die App nach dem requirements.txt-Update bitte neu."
+        ) from exc
+    except (WrongPasswordError, FileNotDecryptedError) as exc:
+        raise PdfExtractionError(
+            "Dieses PDF ist passwortgeschuetzt. Bitte lade eine unverschluesselte Version hoch."
+        ) from exc
+    except (EmptyFileError, PdfReadError) as exc:
+        raise PdfExtractionError(
+            "Dieses PDF konnte nicht gelesen werden. Bitte pruefe die Datei und versuche es erneut."
+        ) from exc
+
     merged = "\n\n".join(all_pages)
     return re.sub(r"\n{3,}", "\n\n", merged).strip()
 
@@ -960,7 +993,11 @@ def main() -> None:
 
     if not st.session_state.pdf_text:
         with st.spinner("Text wird aus dem PDF extrahiert..."):
-            extracted = extract_pdf_text(file_bytes)
+            try:
+                extracted = extract_pdf_text(file_bytes)
+            except PdfExtractionError as exc:
+                st.error(str(exc))
+                return
         st.session_state.pdf_text = extracted
         st.session_state.pdf_title = uploaded_pdf.name.rsplit(".", 1)[0]
 
